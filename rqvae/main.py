@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--beta", type=float, default=0.25, help="Beta for commitment loss")
     parser.add_argument('--layers', type=int, nargs='+', default=[512,256,128,64], help='hidden sizes of every layer')
     parser.add_argument('--save_limit', type=int, default=5, help='save limit for ckpt')
+    parser.add_argument('--use_post_linear', action='store_true', help='Enable shared linear layer after quantization')
+    parser.add_argument('--no_post_linear_bias', action='store_true', help='Disable bias term in the shared linear layer')
     
     parser.add_argument("--ckpt_dir", type=str, default="./ckpt/Beauty", help="please specify output directory for model")
 
@@ -78,6 +80,8 @@ if __name__ == '__main__':
                   kmeans_iters=args.kmeans_iters,
                   sk_epsilons=args.sk_epsilons,
                   sk_iters=args.sk_iters,
+                  use_post_linear=args.use_post_linear,
+                  post_linear_bias=not args.no_post_linear_bias,
                   )
     print(model)
     data_loader = DataLoader(data,num_workers=args.num_workers,
