@@ -13,189 +13,80 @@ from tqdm import tqdm
 
 from datasets import EmbDataset
 from models.rqvae import RQVAE
+from trainer import  Trainer
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Index")
+
+    parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
+    parser.add_argument('--epochs', type=int, default=3000, help='number of epochs')
+    parser.add_argument('--batch_size', type=int, default=1024, help='batch size')
+    parser.add_argument('--num_workers', type=int, default=4, )
+    parser.add_argument('--eval_step', type=int, default=50, help='eval step')
+    parser.add_argument('--learner', type=str, default="AdamW", help='optimizer')
+    parser.add_argument('--lr_scheduler_type', type=str, default="linear", help='scheduler')
+    parser.add_argument('--warmup_epochs', type=int, default=50, help='warmup epochs')
+    parser.add_argument("--data_path", type=str, default="../data/Beauty/item_emb.parquet", help="Input data path.")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help='l2 regularization weight')
+    parser.add_argument("--dropout_prob", type=float, default=0.0, help="dropout ratio")
+    parser.add_argument("--bn", type=bool, default=False, help="use bn or not")
+    parser.add_argument("--loss_type", type=str, default="mse", help="loss_type")
+    parser.add_argument("--kmeans_init", type=bool, default=True, help="use kmeans_init or not")
+    parser.add_argument("--kmeans_iters", type=int, default=100, help="max kmeans iters")
+    parser.add_argument('--sk_epsilons', type=float, nargs='+', default=[0.0, 0.0, 0.003], help="sinkhorn epsilons")
+    parser.add_argument("--sk_iters", type=int, default=50, help="max sinkhorn iters")
+
+    parser.add_argument("--device", type=str, default="cuda:0", help="gpu or cpu")
+
+    parser.add_argument('--num_emb_list', type=int, nargs='+', default=[256,256,256], help='emb num of every vq')
+    parser.add_argument('--e_dim', type=int, default=32, help='vq codebook embedding size')
+    parser.add_argument('--quant_loss_weight', type=float, default=1.0, help='vq quantion loss weight')
+    parser.add_argument("--beta", type=float, default=0.25, help="Beta for commitment loss")
+    parser.add_argument('--layers', type=int, nargs='+', default=[512,256,128,64], help='hidden sizes of every layer')
+    parser.add_argument('--save_limit', type=int, default=5, help='save limit for ckpt')
+    parser.add_argument('--use_post_linear', action='store_true', help='Enable shared linear layer after quantization')
+    parser.add_argument('--no_post_linear_bias', action='store_true', help='Disable bias term in the shared linear layer')
+    
+    parser.add_argument("--ckpt_dir", type=str, default="./ckpt/Beauty", help="please specify output directory for model")
+
+    return parser.parse_args()
 
 
-# ========== 工具函数：冲突检测 ==========
-def check_collision(all_indices_str: np.ndarray) -> bool:
-    """是否所有码串都唯一"""
-    tot_item = len(all_indices_str)
-    tot_indice = len(set(all_indices_str.tolist()))
-    return tot_item == tot_indice
+if __name__ == '__main__':
+    """fix the random seed"""
+    seed = 2024
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
+    args = parse_args()
+    print("=================================================")
+    print(args)
+    print("=================================================")
 
-def get_indices_count(all_indices_str: np.ndarray):
-    """各码串出现次数"""
-    indices_count = collections.defaultdict(int)
-    for index in all_indices_str:
-        indices_count[index] += 1
-    return indices_count
+    logging.basicConfig(level=logging.DEBUG)
 
-
-def get_collision_item(all_indices_str: np.ndarray):
-    """返回撞码样本的分组（每个分组是具有同一码串的一组样本下标）"""
-    index2id = {}
-    for i, index in enumerate(all_indices_str):
-        if index not in index2id:
-            index2id[index] = []
-        index2id[index].append(i)
-
-    collision_item_groups = []
-    for index in index2id:
-        if len(index2id[index]) > 1:
-            collision_item_groups.append(index2id[index])
-
-    return collision_item_groups
-
-
-# ========== 指标统计：冲突率 / 利用率 / 熵 ==========
-def compute_layer_metrics(
-    indices: np.ndarray,
-    num_emb_list=None,
-    layer_names=None,
-    print_table: bool = True,
-):
-    """
-    indices: np.ndarray, 形状 (N, L)，每行是一个样本的逐层索引（不包含最后的“去重位”）
-    num_emb_list: list[int] 或 None，每层码本大小 K_l；若 None，则用 max(index)+1 近似
-    layer_names: list[str] 或 None，仅用于打印名称
-    print_table: 是否打印结果表格
-
-    返回: dict，包含每层指标和汇总
-    """
-    indices = np.asarray(indices)
-    N, L = indices.shape
-    if layer_names is None:
-        layer_names = [f"layer_{i}" for i in range(L)]
-
-    results = []
-    totals = {
-        "N": int(N),
-        "L": int(L),
-        "avg_collision_rate": 0.0,
-        "avg_collision_item_rate": 0.0,
-        "avg_utilization": 0.0 if num_emb_list is not None else None,
-        "avg_entropy_bits": 0.0,
-        "avg_norm_entropy": 0.0 if num_emb_list is not None else None,
-        "avg_perplexity": 0.0,
-    }
-
-    for l in range(L):
-        x = indices[:, l]
-        uniq, counts = np.unique(x, return_counts=True)
-        U = int(uniq.size)
-
-        # 码本大小
-        K = int(num_emb_list[l]) if num_emb_list is not None else int(x.max()) + 1
-
-        # 指标
-        collision_rate = 1.0 - (U / N)                         # 样本 vs 唯一索引
-        collision_item_rate = counts[counts > 1].sum() / N     # 参与冲突的样本占比
-        utilization = (U / K) if num_emb_list is not None else None
-
-        p = counts / N
-        H_bits = float(-(p * np.log2(p)).sum()) if U > 0 else 0.0
-        H_norm = (H_bits / math.log2(K)) if num_emb_list is not None and K > 1 else None
-        perplexity = float(2.0 ** H_bits)
-
-        results.append({
-            "layer": str(layer_names[l]),
-            "N": int(N),
-            "K": int(K),
-            "unique_codes": int(U),
-            "collision_rate": float(collision_rate),
-            "collision_item_rate": float(collision_item_rate),
-            "utilization": float(utilization) if utilization is not None else None,
-            "entropy_bits": float(H_bits),
-            "norm_entropy": float(H_norm) if H_norm is not None else None,
-            "perplexity": float(perplexity),
-        })
-
-    # 汇总（算术平均）
-    totals["avg_collision_rate"] = float(np.mean([r["collision_rate"] for r in results]))
-    totals["avg_collision_item_rate"] = float(np.mean([r["collision_item_rate"] for r in results]))
-    totals["avg_entropy_bits"] = float(np.mean([r["entropy_bits"] for r in results]))
-    totals["avg_perplexity"] = float(np.mean([r["perplexity"] for r in results]))
-    if num_emb_list is not None:
-        totals["avg_utilization"] = float(np.mean([r["utilization"] for r in results]))
-        norm_list = [r["norm_entropy"] for r in results if r["norm_entropy"] is not None]
-        totals["avg_norm_entropy"] = float(np.mean(norm_list)) if norm_list else None
-
-    if print_table:
-        head = f"{'layer':<10}{'N':>8}{'K':>8}{'unique':>10}{'coll_rate':>12}{'item_coll':>12}{'util':>8}{'H(bits)':>12}{'H_norm':>10}{'pplx':>10}"
-        print("\n=== Per-layer metrics ===")
-        print(head)
-        print("-" * len(head))
-        for r in results:
-            print(f"{r['layer']:<10}{r['N']:>8}{r['K']:>8}{r['unique_codes']:>10}"
-                  f"{r['collision_rate']:>12.4f}{r['collision_item_rate']:>12.4f}"
-                  f"{(r['utilization'] if r['utilization'] is not None else float('nan')):>8.4f}"
-                  f"{r['entropy_bits']:>12.4f}"
-                  f"{(r['norm_entropy'] if r['norm_entropy'] is not None else float('nan')):>10.4f}"
-                  f"{r['perplexity']:>10.2f}")
-        print("\nAverages:")
-        print(f"- avg_collision_rate      : {totals['avg_collision_rate']:.4f}")
-        print(f"- avg_collision_item_rate : {totals['avg_collision_item_rate']:.4f}")
-        if totals["avg_utilization"] is not None:
-            print(f"- avg_utilization         : {totals['avg_utilization']:.4f}")
-        print(f"- avg_entropy_bits        : {totals['avg_entropy_bits']:.4f}")
-        if totals["avg_norm_entropy"] is not None:
-            print(f"- avg_norm_entropy        : {totals['avg_norm_entropy']:.4f}")
-        print(f"- avg_perplexity          : {totals['avg_perplexity']:.2f}")
-
-    return {"per_layer": results, "summary": totals}
-
-
-def make_prefix(num_layers: int):
-    """根据层数生成形如 <a_{}>, <b_{}> ... 的前缀列表"""
-    base = []
-    for i in range(num_layers):
-        ch = chr(ord('a') + (i % 26))
-        suffix = "" if i < 26 else str(i // 26)
-        base.append(f"<{ch}{suffix}_{{}}>")
-    return base
-
-
-def main():
-    # ======== 配置（自行修改） ========
-    # dataset = "Beauty"
-    dataset = "Fuse"
-    ckpt_path = f"./ckpt/Fuse_all_split/Oct-19-2025_16-25-58/best_collision_model.pth"
-    output_file = f"../../Our_idea/data/Fuse/{dataset}_t5_rqvae_super_code_3072.npy"
-    device = torch.device("cuda:7")  # 如需CPU可改为 torch.device("cpu")
-
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-    # ======== 加载模型与数据 ========
-    ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'))
-    args = ckpt["args"]
-    state_dict = ckpt["state_dict"]
-
-    print("data_path:", args.data_path)
+    """build dataset"""
     data = EmbDataset(args.data_path)
-    print("Dataset length:", len(data))  # 期望值 N
-
-    use_post_linear = getattr(args, "use_post_linear", False)
-    post_linear_bias = getattr(args, "post_linear_bias", True)
-    model = RQVAE(
-        in_dim=data.dim,
-        num_emb_list=args.num_emb_list,
-        e_dim=args.e_dim,
-        layers=args.layers,
-        dropout_prob=args.dropout_prob,
-        bn=args.bn,
-        loss_type=args.loss_type,
-        quant_loss_weight=args.quant_loss_weight,
-        beta=args.beta,
-        kmeans_init=args.kmeans_init,
-        kmeans_iters=args.kmeans_iters,
-        sk_epsilons=args.sk_epsilons,
-        sk_iters=args.sk_iters,
-        use_post_linear=use_post_linear,
-        post_linear_bias=post_linear_bias,
-    )
-    model.load_state_dict(state_dict)
-    model = model.to(device)
-    model.eval()
+    model = RQVAE(in_dim=data.dim,
+                  num_emb_list=args.num_emb_list,
+                  e_dim=args.e_dim,
+                  layers=args.layers,
+                  dropout_prob=args.dropout_prob,
+                  bn=args.bn,
+                  loss_type=args.loss_type,
+                  quant_loss_weight=args.quant_loss_weight,
+                  beta=args.beta,
+                  kmeans_init=args.kmeans_init,
+                  kmeans_iters=args.kmeans_iters,
+                  sk_epsilons=args.sk_epsilons,
+                  sk_iters=args.sk_iters,
+                  use_post_linear=args.use_post_linear,
+                  post_linear_bias=not args.no_post_linear_bias,
+                  )
     print(model)
 
     data_loader = DataLoader(
