@@ -97,9 +97,13 @@ class VectorQuantizer(nn.Module):
             self.init_emb(latent)
 
         # Calculate the L2 Norm between latent and Embedded weights
+        embedding_for_distance = self.embedding.weight
+        if self.post_quant_linear is not None:
+            embedding_for_distance = self.apply_post_linear(embedding_for_distance)
+
         d = torch.sum(latent**2, dim=1, keepdim=True) + \
-            torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()- \
-            2 * torch.matmul(latent, self.embedding.weight.t())
+            torch.sum(embedding_for_distance**2, dim=1, keepdim=True).t()- \
+            2 * torch.matmul(latent, embedding_for_distance.t())
         if not use_sk or self.sk_epsilon <= 0:
             indices = torch.argmin(d, dim=-1)
         else:

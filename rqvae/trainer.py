@@ -7,6 +7,8 @@ from torch import optim
 from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
 
+from rqvae.metrics import compute_layer_metrics, summarize_layer_max_usage
+
 from utils import ensure_dir,set_color,get_local_time,delete_file
 import os
 
@@ -138,16 +140,59 @@ class Trainer(object):
 
         indices_set = set()
         num_sample = 0
+        collected_indices = []
         for batch_idx, data in enumerate(iter_data):
             num_sample += len(data)
             data = data.to(self.device)
             indices = self.model.get_indices(data)
             indices = indices.view(-1,indices.shape[-1]).cpu().numpy()
+            collected_indices.append(indices)
             for index in indices:
                 code = "-".join([str(int(_)) for _ in index])
                 indices_set.add(code)
 
-        collision_rate = (num_sample - len(list(indices_set)))/num_sample
+        stacked_indices = np.concatenate(collected_indices, axis=0) if collected_indices else np.empty((0, 0), dtype=int)
+
+        if num_sample > 0:
+            collision_rate = (num_sample - len(indices_set))/num_sample
+        else:
+            collision_rate = 0.0
+
+        if stacked_indices.size > 0:
+            metrics = compute_layer_metrics(
+                stacked_indices,
+                num_emb_list=getattr(self.model, "num_emb_list", None),
+                print_table=False,
+            )
+            summary = metrics["summary"]
+            layer_usage = summarize_layer_max_usage(stacked_indices)
+            if layer_usage:
+                worst_usage = max(layer_usage, key=lambda item: item["max_freq_ratio"])
+            else:
+                worst_usage = None
+
+            util = summary.get("avg_utilization")
+            norm_entropy = summary.get("avg_norm_entropy")
+            util_str = f"{util:.4f}" if util is not None else "n/a"
+            norm_entropy_str = f"{norm_entropy:.4f}" if norm_entropy is not None else "n/a"
+            worst_usage_msg = (
+                f"L{worst_usage['layer']} top1_ratio={worst_usage['max_freq_ratio']:.4f}"
+                if worst_usage is not None
+                else "n/a"
+            )
+
+            self.logger.info(
+                "validation codes | collision_rate=%.4f | avg_layer_collision=%.4f | "
+                "avg_entropy_bits=%.4f | avg_norm_entropy=%s | avg_utilization=%s | worst_layer=%s",
+                collision_rate,
+                summary["avg_collision_rate"],
+                summary["avg_entropy_bits"],
+                norm_entropy_str,
+                util_str,
+                worst_usage_msg,
+            )
+        else:
+            self.logger.info("validation codes | no samples available for metric computation")
 
         return collision_rate
 
