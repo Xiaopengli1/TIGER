@@ -80,6 +80,6 @@ class RQVAE(nn.Module):
         else:
             raise ValueError('incompatible loss type')
 
-        loss_total = loss_recon + self.quant_loss_weight * quant_loss
+        loss_total = loss_recon +  self.quant_loss_weight * quant_loss
 
         return loss_total, loss_recon
