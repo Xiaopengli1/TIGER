@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -25,6 +24,8 @@ class RQVAE(nn.Module):
                  # sk_epsilons=[0,0,0.003,0.01]],
                  sk_epsilons=None,
                  sk_iters=100,
+                 usage_ema_decay=0.99,
+                 usage_eps=1e-8,
         ):
         super(RQVAE, self).__init__()
 
@@ -42,6 +43,8 @@ class RQVAE(nn.Module):
         self.kmeans_iters = kmeans_iters
         self.sk_epsilons = sk_epsilons
         self.sk_iters = sk_iters
+        self.usage_ema_decay = usage_ema_decay
+        self.usage_eps = usage_eps
 
         self.encode_layer_dims = [self.in_dim] + self.layers + [self.e_dim]
         self.encoder = MLPLayers(layers=self.encode_layer_dims,
@@ -52,7 +55,9 @@ class RQVAE(nn.Module):
                                           kmeans_init = self.kmeans_init,
                                           kmeans_iters = self.kmeans_iters,
                                           sk_epsilons=self.sk_epsilons,
-                                          sk_iters=self.sk_iters,)
+                                          sk_iters=self.sk_iters,
+                                          usage_ema_decay=self.usage_ema_decay,
+                                          eps=self.usage_eps,)
 
         self.decode_layer_dims = self.encode_layer_dims[::-1]
         self.decoder = MLPLayers(layers=self.decode_layer_dims,
@@ -83,3 +88,20 @@ class RQVAE(nn.Module):
         loss_total = loss_recon + self.quant_loss_weight * quant_loss
 
         return loss_total, loss_recon
+
+    def get_quantizer_statistics(self):
+        """Expose residual quantizer usage statistics."""
+
+        return self.rq.get_usage_statistics()
+
+    def prune_quantizers(self, usage_threshold, entropy_threshold, min_quantizers=1):
+        """Prune residual quantizer layers and keep hyperparameters in sync."""
+
+        pruned = self.rq.prune_quantizers(
+            usage_threshold=usage_threshold,
+            entropy_threshold=entropy_threshold,
+            min_quantizers=min_quantizers,
+        )
+        if pruned:
+            self.num_emb_list = self.rq.n_e_list
+        return pruned
