@@ -25,6 +25,8 @@ class RQVAE(nn.Module):
                  # sk_epsilons=[0,0,0.003,0.01]],
                  sk_epsilons=None,
                  sk_iters=100,
+                 use_post_linear=False,
+                 post_linear_bias=True,
         ):
         super(RQVAE, self).__init__()
 
@@ -42,6 +44,8 @@ class RQVAE(nn.Module):
         self.kmeans_iters = kmeans_iters
         self.sk_epsilons = sk_epsilons
         self.sk_iters = sk_iters
+        self.use_post_linear = use_post_linear
+        self.post_linear_bias = post_linear_bias
 
         self.encode_layer_dims = [self.in_dim] + self.layers + [self.e_dim]
         self.encoder = MLPLayers(layers=self.encode_layer_dims,
@@ -52,7 +56,9 @@ class RQVAE(nn.Module):
                                           kmeans_init = self.kmeans_init,
                                           kmeans_iters = self.kmeans_iters,
                                           sk_epsilons=self.sk_epsilons,
-                                          sk_iters=self.sk_iters,)
+                                          sk_iters=self.sk_iters,
+                                          use_post_linear=self.use_post_linear,
+                                          post_linear_bias=self.post_linear_bias,)
 
 
         self.decode_layer_dims = self.encode_layer_dims[::-1]
@@ -81,6 +87,6 @@ class RQVAE(nn.Module):
         else:
             raise ValueError('incompatible loss type')
 
-        loss_total = loss_recon + self.quant_loss_weight * quant_loss
+        loss_total = loss_recon +  self.quant_loss_weight * quant_loss
 
         return loss_total, loss_recon
