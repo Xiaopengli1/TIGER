@@ -54,6 +54,7 @@ class RQVAE(nn.Module):
                                           sk_epsilons=self.sk_epsilons,
                                           sk_iters=self.sk_iters,)
 
+
         self.decode_layer_dims = self.encode_layer_dims[::-1]
         self.decoder = MLPLayers(layers=self.decode_layer_dims,
                                        dropout=self.dropout_prob,bn=self.bn)
